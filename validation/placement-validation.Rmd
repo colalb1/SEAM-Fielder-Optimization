@@ -1,0 +1,1141 @@
+---
+title: "Placement Validation"
+author: "Colin Alberts"
+date: "2023-12-07"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 0: Setup
+## 0.1: Packages and Dev Tools
+
+```{r}
+shiny_seam_helper = function(b, p, br, pr) {
+  do_full_seam_matchup(
+    .batter = lu_b(b_lu, b),
+    .pitcher = lu_p(p_lu, p),
+    .bip = bip,
+    .batter_pool = batter_pool,
+    .pitcher_pool = pitcher_pool,
+    .ratio_batter = br,
+    .ratio_pitcher = pr
+  )
+}
+
+library(dplyr)
+library(plotrix)
+library(data.table)
+library(GenSA)
+library(ggplot2)
+library(ggforce)
+library(berryFunctions)
+library(xtable)
+`%notin%` <- Negate(`%in%`)
+
+devtools::load_all()
+```
+
+## 0.2: Data
+
+```{r}
+bip = readRDS("data/bip.Rds")
+b_lu = data.frame(readRDS("data/b-lu.Rds")) # why is this so much faster as a data frame
+p_lu = data.frame(readRDS("data/p-lu.Rds")) # why is this so much faster as a data frame
+batter_pool = readRDS("data/batter-pool.Rds")
+pitcher_pool = readRDS("data/pitcher-pool.Rds")
+mlb_teams = readRDS("data/mlb-teams.Rds")
+stadiums = readRDS("data/stadiums.Rds")
+stadium_paths = readRDS("data/stadium-paths.Rds")
+
+sCDF = data.frame(readRDS("stadiumCoordinates.rds")) #this is the file containing the stadium coordinates
+dense_coordinates = data.frame(readRDS("dense-stadium-coordinates.rds"))
+statcast_raw = data.table(readRDS("2022-full-validation.rds"))
+```
+
+## 0.3: Calculation Helpers
+
+```{r}
+euclidean = function(a, b) {sqrt(sum((a - b) ^ 2))}
+converter = 36.11364 / 90
+```
+
+## 0.4: First Baseman Constraints
+
+```{r}
+# furthest distance a first baseman should be from first base
+first_baseman_furthest = euclidean(c(38.52792, 124.159574), c(90/sqrt(2), 90/sqrt(2))) * 24.27639 / 60.5 / 2
+first_base_coords = c(25.5362, 25.5362)
+constant_range = 45
+```
+
+
+# 1: Method Functions
+
+## 1.1: Fielder Range
+
+```{r}
+# function defining fielder's range based on their position
+f_range_func = function(euclid) {
+  f_range_data = data.table(x = c(0, 140 * converter, 250 * converter),
+                            y = c(10 * converter, 30 * converter, 50 * converter))
+  f_range_parabola = lm(y ~ poly(x, 2, raw = TRUE), data = f_range_data)
+  return(ifelse(euclid > 250 * converter,
+                50 * converter,
+                predict(f_range_parabola, newdata = data.table(x = euclid))))
+}
+```
+
+## 1.2: Sum of Range Weight
+
+```{r}
+# takes sum of the weights inside of fielder's range
+sum_in_ellipse = function(par, index, filter_field) {
+  
+  x_j = par[index] #player x-coordinate
+  y_j = par[index + 1] #player y-coordinate
+  euclid = euclidean(c(x_j, y_j), c(0, 0))
+  
+  # angle for which the field will be rotated to align the ellipse of each fielder
+  rotation_angle = -atan(y_j / x_j) - pi / 2
+  
+  if (rotation_angle == 0) {
+    rotated_x_j = x_j
+    rotated_y_j = y_j
+  } else {
+    rotated_x_j = x_j * cos(rotation_angle) - y_j * sin(rotation_angle) #rotate point
+    rotated_y_j = y_j * cos(rotation_angle) + x_j * sin(rotation_angle) #rotate point
+  }
+  
+  # fielder range
+  f_range = f_range_func(euclid)
+  
+  # forward and backward range is 85% of side-to-side range
+  x_range = f_range; y_range = f_range * 0.85
+  
+  # rotating field and filtering values inside of player's ellipse
+  temp_set = as.data.table(filter_field)
+  temp_set[,  ":=" (rotated_x = x * cos(rotation_angle) - y * sin(rotation_angle),
+                    rotated_y = y * cos(rotation_angle) + x * sin(rotation_angle))] #computing distance to fielder
+  temp_set[,  ":=" (in_ellipse = sqrt((rotated_x - rotated_x_j) ^ 2 / (x_range ^ 2) + (rotated_y - rotated_y_j) ^ 2 / (y_range ^ 2)) <= 1)]
+  temp_set = temp_set[in_ellipse == TRUE, ]
+  
+  # summing area in ellipse
+  area_sum = sum(temp_set$z)
+  
+  # barrier function for first baseman
+  barrier = function(player_x, player_y) {
+    distance_from_first = euclidean(first_base_coords, c(player_x, player_y))
+    
+    if (distance_from_first > 40 * converter) {
+      return(-Inf)
+    }
+    return(area_sum)
+  }
+  if (index == 13) {
+    area_sum = barrier(x_j, y_j)
+  }
+  return(area_sum)
+}
+```
+
+## 1.3: Field Filter Helper
+
+```{r}
+# calculates proportion of field left uncovered by the players; essentially the same as previous function
+filter_field_value = function(field_params) {
+  
+  final_field = as.data.table(seam_ex_in_stadium)
+  for (k in seq(1, length(field_params), 2)) {
+    x_j = field_params[k]
+    y_j = field_params[k + 1]
+    
+    rotation_angle = -atan(y_j / x_j) - pi / 2
+    
+    if (rotation_angle == 0) {
+      rotated_x_j = x_j
+      rotated_y_j = y_j
+    } else {
+      rotated_x_j = x_j * cos(rotation_angle) - y_j * sin(rotation_angle) #rotate point
+      rotated_y_j = y_j * cos(rotation_angle) + x_j * sin(rotation_angle) #rotate point
+    }
+    
+    #distance of player from home, used to compute range
+    euclid = euclidean(c(x_j, y_j), c(0, 0))
+    
+    f_range = f_range_func(euclid)
+    x_range = f_range; y_range = f_range * 0.85
+    
+    
+    if (rotation_angle == 0) {
+      temp_set = as.data.table(final_field)
+      temp_set[,  ":=" (rotated_x = x,
+                        rotated_y = y)] #computing distance to fielder
+      temp_set[,  ":=" (in_ellipse = sqrt((rotated_x - rotated_x_j) ^ 2 / (x_range ^ 2) + (rotated_y - rotated_y_j) ^ 2 / (y_range ^ 2)) <= 1)]
+      temp_set = temp_set[in_ellipse == FALSE, ]
+      
+    } else {
+      temp_set = as.data.table(final_field)
+      temp_set[,  ":=" (rotated_x = x * cos(rotation_angle) - y * sin(rotation_angle),
+                        rotated_y = y * cos(rotation_angle) + x * sin(rotation_angle))]
+      temp_set[,  ":=" (in_ellipse = sqrt((rotated_x - rotated_x_j) ^ 2 / (x_range ^ 2) + (rotated_y - rotated_y_j) ^ 2 / (y_range ^ 2)) <= 1)]
+      temp_set = temp_set[in_ellipse == FALSE, ]
+      temp_set[,  ":=" (x = rotated_x * cos(-rotation_angle) - rotated_y * sin(-rotation_angle),
+                        y = rotated_y * cos(-rotation_angle) + rotated_x * sin(-rotation_angle))]
+    }
+    final_field = temp_set
+  }
+  return((sum(seam_ex_in_stadium$z) - sum(final_field$z)) / sum(seam_ex_in_stadium$z))
+}
+```
+
+## 1.4: Maximization Method
+
+```{r}
+# function maximizing weights covered by the fielders
+sum_maximization_coverage_function = function(point_iters, SANN_iters) {
+  
+  convergence_vec = c()
+  
+  # standard coordinates
+  fielder_parameters = c(0, converter * 321, converter * 297 * cos(117 * pi / 180), converter * 297 * sin(117 * pi / 180), converter * 294 * cos(62 * pi / 180), converter * 294 * sin(62 * pi / 180), converter * 118 * cos(120 * pi / 180), converter * 118 * sin(120 * pi / 180), converter * 148 * cos(101 * pi / 180), converter * 148 * sin(101 * pi / 180), converter * 151 * cos(78 * pi / 180), converter * 151 * sin(78 * pi / 180), converter * 110 * cos(55 * pi / 180), converter * 110 * sin(55 * pi / 180))
+  
+  # number of times method will iterate over each coordinate
+  for (i in seq(1, length(fielder_parameters) * point_iters, 2)) {
+    if (i > length(fielder_parameters)) {
+      i = i %% length(fielder_parameters)
+    }
+    
+    
+    # setting temporary field
+    current_field = as.data.table(seam_ex_in_stadium)
+    
+    # filtering pitcher and catcher
+    current_field = as.data.table(current_field); current_field[,  ":=" (dist_to_fielder = sqrt((x - 0) ^ 2 + (y - 0) ^ 2))]; current_field = current_field[dist_to_fielder >= 36.11364 / 90 * 20, ] #range was 5
+    current_field = current_field[, .(x, y, z)]
+    
+    # cutting out other players' ellipses from the distribution so I can optimize with mitigated overlap
+    for (j in seq(1, length(fielder_parameters), 2)) { 
+      
+      # filtering the temporary field for all parameters besides the player I want to move
+      x_j = fielder_parameters[j]
+      y_j = fielder_parameters[j + 1]
+      
+      if (j == i) { # skipping if this is the fielder I am optimizing for
+        next
+      }
+      
+      rotation_angle = -atan(y_j / x_j) - pi / 2
+      
+      if (rotation_angle == 0) {
+        rotated_x_j = x_j
+        rotated_y_j = y_j
+      } else {
+        rotated_x_j = x_j * cos(rotation_angle) - y_j * sin(rotation_angle) #rotate point
+        rotated_y_j = y_j * cos(rotation_angle) + x_j * sin(rotation_angle) #rotate point
+      }
+      
+      # distance of player from home, used to compute range
+      euclid = euclidean(c(x_j, y_j), c(0, 0))
+      
+      f_range = f_range_func(euclid)
+      x_range = f_range; y_range = f_range * 0.85
+      
+      
+      if (rotation_angle == 0) {
+        temp_set = as.data.table(current_field)
+        temp_set[,  ":=" (rotated_x = x,
+                          rotated_y = y)] # computing distance to fielder
+        temp_set[,  ":=" (in_ellipse = sqrt((rotated_x - rotated_x_j) ^ 2 / (x_range ^ 2) + (rotated_y - rotated_y_j) ^ 2 / (y_range ^ 2)) <= 1)]
+        temp_set = temp_set[in_ellipse == FALSE, ]
+        
+      } else {
+        temp_set = as.data.table(current_field)
+        temp_set[,  ":=" (rotated_x = x * cos(rotation_angle) - y * sin(rotation_angle),
+                          rotated_y = y * cos(rotation_angle) + x * sin(rotation_angle))]
+        temp_set[,  ":=" (in_ellipse = sqrt((rotated_x - rotated_x_j) ^ 2 / (x_range ^ 2) + (rotated_y - rotated_y_j) ^ 2 / (y_range ^ 2)) <= 1)]
+        temp_set = temp_set[in_ellipse == FALSE, ]
+        temp_set[,  ":=" (x = rotated_x * cos(-rotation_angle) - rotated_y * sin(-rotation_angle),
+                          y = rotated_y * cos(-rotation_angle) + rotated_x * sin(-rotation_angle))]
+      }
+      current_field = temp_set
+    }
+    
+    #optimizing for current fielder using SANN; this is older version using optim instead of SANN package
+    temp_optim = optim(par = fielder_parameters,
+                       index = i,
+                       filter_field = current_field,
+                       fn = sum_in_ellipse,
+                       method = "SANN",
+                       control = list(maxit = SANN_iters,
+                                      fnscale = -1))
+    
+    
+    # setting the parameters to the new parameters from the output
+    fielder_parameters[i] = temp_optim$par[i]
+    fielder_parameters[i + 1] = temp_optim$par[i + 1]
+    
+    final_fielder_parameters = fielder_parameters
+    
+    # Calculating final coverage value
+    temp_coverage_val = filter_field_value(final_fielder_parameters)
+    convergence_vec = c(convergence_vec, temp_coverage_val)
+    if (length(convergence_vec) > 50) {
+      if (convergence_vec[length(convergence_vec)] - convergence_vec[length(convergence_vec) - 25] < 0.0005) {
+        return(list(final_fielder_parameters, convergence_vec))
+      }
+    }
+  }
+  return(list(final_fielder_parameters, convergence_vec))
+}
+```
+
+## 1.5: Plotting Helper Function
+
+```{r}
+plot_the_sim = function(par) {
+  x_s = c(par[1], par[3], par[5], par[7], par[9], par[11], par[13])
+  y_s = c(par[2], par[4], par[6], par[8], par[10], par[12], par[14])
+  
+  ggplot(seam_ex_in_stadium, aes(x = x, y = y, color = z)) + 
+    geom_point(size = 4) +
+    scale_color_gradientn(colours = rev(rainbow(8))) +
+    geom_point(data = data.frame(x_s = x_s, y_s = y_s), aes(x = x_s, y = y_s), color = "black", shape = 18, size = 5) +
+    geom_point(data = data.frame(x_s = c(0, 0), y_s = c(0, 36.11364 / 90 * 60.5)), aes(x = c(0, 0), y = c(0, 36.11364 / 90 * 60.5)), color = "black", shape = 18, size = 5) + 
+    geom_point(data = data.frame(x_s = c(-36.11364 / sqrt(2), 0,  36.11364 / sqrt(2)), 
+                                 y_s = c(36.11364 / sqrt(2), 36.11364 * sqrt(2), 36.11364 / sqrt(2))), 
+               aes(x = c(-36.11364 / sqrt(2), 0,  36.11364 / sqrt(2)), y = c(36.11364 / sqrt(2), 36.11364 * sqrt(2), 36.11364 / sqrt(2))), 
+               color = "white", shape = 15, size = 6) + 
+    xlab("X-vals") + ylab("Y-vals") + labs(title = "Plot the Players")
+}
+```
+
+## 1.6: BABIP Coverage Function
+
+```{r}
+babip_coverage = function(field_params) {
+  
+  final_field = as.data.table(seam_ex_in_stadium)
+  for (k in seq(1, length(field_params), 2)) {
+    x_j = field_params[k]
+    y_j = field_params[k + 1]
+    
+    rotation_angle = -atan(y_j / x_j) - pi / 2
+    
+    if (rotation_angle == 0) {
+      rotated_x_j = x_j
+      rotated_y_j = y_j
+    } else {
+      rotated_x_j = x_j * cos(rotation_angle) - y_j * sin(rotation_angle) #rotate point
+      rotated_y_j = y_j * cos(rotation_angle) + x_j * sin(rotation_angle) #rotate point
+    }
+    
+    # distance of player from home, used to compute range
+    euclid = euclidean(c(x_j, y_j), c(0, 0))
+    
+    f_range = f_range_func(euclid)
+    x_range = f_range; y_range = f_range * 0.85
+    
+    
+    if (rotation_angle == 0) {
+      temp_set = as.data.table(final_field)
+      temp_set[,  ":=" (rotated_x = x,
+                        rotated_y = y)] # computing distance to fielder
+      temp_set[,  ":=" (in_ellipse = sqrt((rotated_x - rotated_x_j) ^ 2 / (x_range ^ 2) + (rotated_y - rotated_y_j) ^ 2 / (y_range ^ 2)) <= 1)]
+      temp_set = temp_set[in_ellipse == FALSE, ]
+      
+    } else {
+      temp_set = as.data.table(final_field)
+      temp_set[,  ":=" (rotated_x = x * cos(rotation_angle) - y * sin(rotation_angle),
+                        rotated_y = y * cos(rotation_angle) + x * sin(rotation_angle))]
+      temp_set[,  ":=" (in_ellipse = sqrt((rotated_x - rotated_x_j) ^ 2 / (x_range ^ 2) + (rotated_y - rotated_y_j) ^ 2 / (y_range ^ 2)) <= 1)]
+      temp_set = temp_set[in_ellipse == FALSE, ]
+      temp_set[,  ":=" (x = rotated_x * cos(-rotation_angle) - rotated_y * sin(-rotation_angle),
+                        y = rotated_y * cos(-rotation_angle) + rotated_x * sin(-rotation_angle))]
+    }
+    final_field = temp_set
+  }
+  return(sum(seam_ex_in_stadium$z) - sum(final_field$z))
+}
+```
+
+## 1.7: Coordinates in Range
+
+```{r}
+in_range_coverage = function(field_params, sample_size) {
+  
+  final_field = as.data.table(seam_ex_in_stadium)
+  
+  for (k in seq(1, length(field_params), 2)) {
+    x_j = field_params[k]
+    y_j = field_params[k + 1]
+    
+    rotation_angle = -atan(y_j / x_j) - pi / 2
+    
+    if (rotation_angle == 0) {
+      rotated_x_j = x_j
+      rotated_y_j = y_j
+    } else {
+      rotated_x_j = x_j * cos(rotation_angle) - y_j * sin(rotation_angle) # rotate point
+      rotated_y_j = y_j * cos(rotation_angle) + x_j * sin(rotation_angle) # rotate point
+    }
+    
+    #distance of player from home, used to compute range
+    euclid = euclidean(c(x_j, y_j), c(0, 0))
+    
+    f_range = f_range_func(euclid)
+    x_range = f_range; y_range = f_range * 0.85
+    
+    
+    if (rotation_angle == 0) {
+      temp_set = as.data.table(final_field)
+      temp_set[,  ":=" (rotated_x = x,
+                        rotated_y = y)] #computing distance to fielder
+      temp_set[,  ":=" (in_ellipse = sqrt((rotated_x - rotated_x_j) ^ 2 / (x_range ^ 2) + (rotated_y - rotated_y_j) ^ 2 / (y_range ^ 2)) <= 1)]
+      temp_set = temp_set[in_ellipse == FALSE, ]
+      
+    } else {
+      temp_set = as.data.table(final_field)
+      temp_set[,  ":=" (rotated_x = x * cos(rotation_angle) - y * sin(rotation_angle),
+                        rotated_y = y * cos(rotation_angle) + x * sin(rotation_angle))]
+      temp_set[,  ":=" (in_ellipse = sqrt((rotated_x - rotated_x_j) ^ 2 / (x_range ^ 2) + (rotated_y - rotated_y_j) ^ 2 / (y_range ^ 2)) <= 1)]
+      temp_set = temp_set[in_ellipse == FALSE, ]
+      temp_set[,  ":=" (x = rotated_x * cos(-rotation_angle) - rotated_y * sin(-rotation_angle),
+                        y = rotated_y * cos(-rotation_angle) + rotated_x * sin(-rotation_angle))]
+    }
+    final_field = temp_set
+  }
+  set.seed(123)
+  sampled_rows = seam_ex_in_stadium[sample(nrow(seam_ex_in_stadium), 
+                                           size = sample_size, 
+                                           replace = TRUE, 
+                                           prob = seam_ex_in_stadium$z), ]
+  
+  in_field = sampled_rows |> 
+    filter(paste(x, y) %notin% paste(final_field$x, final_field$y))
+  
+  return(nrow(in_field) / sample_size)
+}
+```
+
+## 1.8.pre: Cleaning Statcast Raw
+
+```{r}
+# this is the 2022 validation data
+statcast_raw = statcast_raw[, c("pitcher_name", "batter_name", "events", "description", "stand", "p_throws", "hc_x", "hc_y")]
+statcast_raw[, hc_x := (hc_x - 125.42)]; statcast_raw[, hc_y := (198.27 - hc_y)]; statcast_raw = na.omit(statcast_raw)
+statcast_raw = statcast_raw[hc_y >= hc_x & hc_y >= -hc_x]
+statcast_raw = statcast_raw[events != "home_run"]
+setnames(statcast_raw, old = "hc_x", new = "x"); setnames(statcast_raw, old = "hc_y", new = "y")
+```
+
+## 1.8: Coodinates in Range Out-of-Sample
+
+```{r}
+in_range_coverage_oos = function(field_params, sample_size, batter_name) {
+  
+  # Output is predicted BABIP, want output to be smaller for optimized version
+  final_field = statcast_raw[batter_name == batter_name]
+  set.seed(123)
+  final_field = final_field[sample(nrow(final_field),
+                                   size = sample_size,
+                                   replace = TRUE), ]
+  final_field = final_field[, x := jitter(x, factor = 600)]; final_field = final_field[, y := jitter(y, factor = 600)]
+  final_field_2 = copy(final_field)
+  
+  
+  for (k in seq(1, length(field_params), 2)) {
+    x_j = field_params[k]
+    y_j = field_params[k + 1]
+    
+    rotation_angle = -atan(y_j / x_j) - pi / 2
+    
+    if (rotation_angle == 0) {
+      rotated_x_j = x_j
+      rotated_y_j = y_j
+    } else {
+      rotated_x_j = x_j * cos(rotation_angle) - y_j * sin(rotation_angle) #rotate point
+      rotated_y_j = y_j * cos(rotation_angle) + x_j * sin(rotation_angle) #rotate point
+    }
+    
+    #distance of player from home, used to compute range
+    euclid = euclidean(c(x_j, y_j), c(0, 0))
+    
+    f_range = f_range_func(euclid)
+    x_range = f_range; y_range = f_range * 0.85
+    
+    
+    if (rotation_angle == 0) {
+      temp_set = as.data.table(final_field)
+      temp_set[,  ":=" (rotated_x = x,
+                        rotated_y = y)] #computing distance to fielder
+      temp_set[,  ":=" (in_ellipse = sqrt((rotated_x - rotated_x_j) ^ 2 / (x_range ^ 2) + (rotated_y - rotated_y_j) ^ 2 / (y_range ^ 2)) <= 1)]
+      temp_set = temp_set[in_ellipse == FALSE, ]
+      
+    } else {
+      temp_set = as.data.table(final_field)
+      temp_set[,  ":=" (rotated_x = x * cos(rotation_angle) - y * sin(rotation_angle),
+                        rotated_y = y * cos(rotation_angle) + x * sin(rotation_angle))]
+      temp_set[,  ":=" (in_ellipse = sqrt((rotated_x - rotated_x_j) ^ 2 / (x_range ^ 2) + (rotated_y - rotated_y_j) ^ 2 / (y_range ^ 2)) <= 1)]
+      temp_set = temp_set[in_ellipse == FALSE, ]
+      temp_set[,  ":=" (x = rotated_x * cos(-rotation_angle) - rotated_y * sin(-rotation_angle),
+                        y = rotated_y * cos(-rotation_angle) + rotated_x * sin(-rotation_angle))]
+    }
+    final_field = temp_set
+  }
+  return(nrow(final_field) / sample_size)
+}
+```
+
+
+
+# 2: Player Testing
+
+This section was mainly used for testing.
+
+## 2.1: Define Players and Stadium
+
+```{r}
+# seam_ex = shiny_seam_helper(
+#   b = "Jake Burger",
+#   p = "Merrill Kelly",
+#   br = .85,
+#   pr = .85)$seam_df
+# 
+# stadium = "white_sox"
+# 
+# stadium_index = which(sCDF$stadiumName == stadium)
+# 
+# stadium_df = data.frame(
+#   x = sCDF[stadium_index, 2][[1]],
+#   y = sCDF[stadium_index, 3][[1]]
+# )
+# 
+# seam_ex_in_stadium = seam_ex |>
+#   filter(paste(x, y) %in% paste(stadium_df$x, stadium_df$y))
+# 
+# #changed to data table for computational speed
+# seam_ex_in_stadium = as.data.table(seam_ex_in_stadium); seam_ex_in_stadium[,  ":=" (euclid = sqrt(x ^ 2 + y ^ 2))]
+```
+
+
+## 2.2: Calculating Alignment
+
+```{r}
+# sim_ann_maximization = sum_maximization_coverage_function(500, 500)
+# sim_ann_output = sim_ann_maximization[[1]]; sim_ann_coverage = sim_ann_maximization[[2]]
+# plot(1:length(sim_ann_coverage), sim_ann_coverage)
+# plot_the_sim(sim_ann_output)
+```
+
+
+## 2.3: BABIP Calculations
+
+```{r}
+# Standard Configuration Coverage
+# standard_coverage = babip_coverage(c(0,
+#                                      converter * 321,
+#                                      converter * 297 * cos(117 * pi / 180),
+#                                      converter * 297 * sin(117 * pi / 180),
+#                                      converter * 294 * cos(62 * pi / 180),
+#                                      converter * 294 * sin(62 * pi / 180),
+#                                      converter * 118 * cos(120 * pi / 180),
+#                                      converter * 118 * sin(120 * pi / 180),
+#                                      converter * 148 * cos(101 * pi / 180),
+#                                      converter * 148 * sin(101 * pi / 180),
+#                                      converter * 151 * cos(78 * pi / 180),
+#                                      converter * 151 * sin(78 * pi / 180),
+#                                      converter * 110 * cos(55 * pi / 180),
+#                                      converter * 110 * sin(55 * pi / 180)))
+# SEAM Configuration Coverage
+# seam_coverage = babip_coverage(sim_ann_output)
+# print((seam_coverage - standard_coverage) / standard_coverage)
+```
+
+## 2.4: Automating BABIP Relative Error Calculations (using batters from the similar paper)
+
+### 2.4.1: List of Batters
+
+```{r}
+rh_batters = c("Jose Altuve",
+              "Nolan Arenado",
+              "Lorenzo Cain",
+              # "Todd Frazier",
+              "Evan Longoria", 
+              "Albert Pujols",
+              "Mike Trout",
+              "Hunter Renfroe",
+              "Trey Mancini",
+              "Vladimir Guerrero", # no Jr. in SEAM
+              "Taylor Ward"
+              )
+
+lh_batters = c("Matt Carpenter",
+               "Freddie Freeman",
+               "Joey Gallo",
+               "Dee Strange-Gordon",
+               "Bryce Harper",
+               "Jason Heyward",
+               "Kevin Kiermaier",
+               "Anthony Rizzo",
+               "Joey Votto",
+               "Tony Kemp"
+               )
+```
+
+### 2.4.2: List of Pitchers
+
+```{r}
+# pitchers = c(ERA mean, WHIP mean, (batting) AVG mean) for these qualified: 
+# https://www.mlb.com/stats/pitching?page=2&sortState=asc
+rh_pitchers = c("Logan Gilbert",
+                "Merrill Kelly",
+                "Kyle Wright")
+
+lh_pitchers = c("Jordan Montgomery",
+                "Framber Valdez",
+                "Robbie Ray")
+```
+
+### 2.4.3: Creating Table and Setting Standard Coverage
+
+```{r}
+matchup_dt = data.table(pitcher = character(),
+                        batter = character(),
+                        rhp = logical(),
+                        rhb = logical(),
+                        babip_rel_err = numeric())
+matchup_dt = rbind(matchup_dt, list(pitcher = "",
+                                    batter = "",
+                                    rhp = FALSE,
+                                    rhb = FALSE,
+                                    babip_rel_err = 0))
+# standard_coverage = in_range_coverage_oos(c(0, 
+#                                             converter * 321, 
+#                                             converter * 297 * cos(117 * pi / 180), 
+#                                             converter * 297 * sin(117 * pi / 180), 
+#                                             converter * 294 * cos(62 * pi / 180), 
+#                                             converter * 294 * sin(62 * pi / 180), 
+#                                             converter * 118 * cos(120 * pi / 180), 
+#                                             converter * 118 * sin(120 * pi / 180), 
+#                                             converter * 148 * cos(101 * pi / 180), 
+#                                             converter * 148 * sin(101 * pi / 180), 
+#                                             converter * 151 * cos(78 * pi / 180), 
+#                                             converter * 151 * sin(78 * pi / 180), 
+#                                             converter * 110 * cos(55 * pi / 180), 
+#                                             converter * 110 * sin(55 * pi / 180)),
+#                                           10000,)
+
+```
+
+### 2.4.4: Generating Validation Using Out-of-Sample Data
+
+```{r}
+# Could be more efficient with vectorization and function to shorten the code
+
+# iterating through RHB
+for (i in 1:length(rh_batters)) {
+
+  # calculating standard coverage for given batter
+  standard_coverage_sampling = in_range_coverage_oos(c(0,
+                                                       converter * 321,
+                                                       converter * 297 * cos(117 * pi / 180),
+                                                       converter * 297 * sin(117 * pi / 180),
+                                                       converter * 294 * cos(62 * pi / 180),
+                                                       converter * 294 * sin(62 * pi / 180),
+                                                       converter * 118 * cos(120 * pi / 180),
+                                                       converter * 118 * sin(120 * pi / 180),
+                                                       converter * 148 * cos(101 * pi / 180),
+                                                       converter * 148 * sin(101 * pi / 180),
+                                                       converter * 151 * cos(78 * pi / 180),
+                                                       converter * 151 * sin(78 * pi / 180),
+                                                       converter * 110 * cos(55 * pi / 180),
+                                                       converter * 110 * sin(55 * pi / 180)),
+                                                     10000,
+                                                     rh_batters[i])
+
+
+  # iterating through RHP
+  for (j in 1:length(rh_pitchers)) {
+
+    seam_ex = shiny_seam_helper(
+    b = rh_batters[i],
+    p = rh_pitchers[j],
+    br = .85,
+    pr = .85)$seam_df
+
+    stadium_index = which(sCDF$stadiumName == "white_sox")
+
+    stadium_df = data.frame(
+      x = sCDF[stadium_index, 2][[1]],
+      y = sCDF[stadium_index, 3][[1]]
+    )
+
+    seam_ex_in_stadium = seam_ex |>
+      filter(paste(x, y) %in% paste(stadium_df$x, stadium_df$y))
+
+    #changed to data table for computational speed
+    seam_ex_in_stadium = as.data.table(seam_ex_in_stadium); seam_ex_in_stadium[,  ":=" (euclid = sqrt(x ^ 2 + y ^ 2))]
+
+    sim_ann_maximization = sum_maximization_coverage_function(500, 500)
+    sim_ann_output = sim_ann_maximization[[1]]; sim_ann_coverage = sim_ann_maximization[[2]]
+
+    seam_coverage = in_range_coverage_oos(sim_ann_output,
+                                          10000,
+                                          rh_batters[i])
+
+    temp_row = list(pitcher = rh_pitchers[j],
+                    batter = rh_batters[i],
+                    rhp = TRUE,
+                    rhb = TRUE,
+                    babip_rel_err = (seam_coverage - standard_coverage_sampling) / standard_coverage_sampling)
+    matchup_dt = rbind(matchup_dt,
+                       temp_row)
+  }
+
+  # iterating through LHP
+  for (j in 1:length(lh_pitchers)) {
+
+    seam_ex = shiny_seam_helper(
+    b = rh_batters[i],
+    p = lh_pitchers[j],
+    br = .85,
+    pr = .85)$seam_df
+
+    stadium_index = which(sCDF$stadiumName == "white_sox")
+
+    stadium_df = data.frame(
+      x = sCDF[stadium_index, 2][[1]],
+      y = sCDF[stadium_index, 3][[1]]
+    )
+
+    seam_ex_in_stadium = seam_ex |>
+      filter(paste(x, y) %in% paste(stadium_df$x, stadium_df$y))
+
+    #changed to data table for computational speed
+    seam_ex_in_stadium = as.data.table(seam_ex_in_stadium); seam_ex_in_stadium[,  ":=" (euclid = sqrt(x ^ 2 + y ^ 2))]
+
+    sim_ann_maximization = sum_maximization_coverage_function(500, 500)
+    sim_ann_output = sim_ann_maximization[[1]]; sim_ann_coverage = sim_ann_maximization[[2]]
+
+    seam_coverage = in_range_coverage_oos(sim_ann_output,
+                                          10000,
+                                          rh_batters[i])
+
+    temp_row = list(pitcher = lh_pitchers[j],
+                    batter = rh_batters[i],
+                    rhp = FALSE,
+                    rhb = TRUE,
+                    babip_rel_err = (seam_coverage - standard_coverage_sampling) / standard_coverage_sampling)
+    matchup_dt = rbind(matchup_dt,
+                       temp_row)
+
+  }
+}
+
+# iterating through LHB
+for (i in 1:length(lh_batters)) {
+
+  # calculating standard coverage for given batter
+  standard_coverage_sampling = in_range_coverage_oos(c(0,
+                                                       converter * 321,
+                                                       converter * 297 * cos(117 * pi / 180),
+                                                       converter * 297 * sin(117 * pi / 180),
+                                                       converter * 294 * cos(62 * pi / 180),
+                                                       converter * 294 * sin(62 * pi / 180),
+                                                       converter * 118 * cos(120 * pi / 180),
+                                                       converter * 118 * sin(120 * pi / 180),
+                                                       converter * 148 * cos(101 * pi / 180),
+                                                       converter * 148 * sin(101 * pi / 180),
+                                                       converter * 151 * cos(78 * pi / 180),
+                                                       converter * 151 * sin(78 * pi / 180),
+                                                       converter * 110 * cos(55 * pi / 180),
+                                                       converter * 110 * sin(55 * pi / 180)),
+                                                     10000,
+                                                     lh_batters[i])
+
+  # iterating through RHP
+  for (j in 1:length(rh_pitchers)) {
+
+    seam_ex = shiny_seam_helper(
+    b = lh_batters[i],
+    p = rh_pitchers[j],
+    br = .85,
+    pr = .85)$seam_df
+
+    stadium_index = which(sCDF$stadiumName == "white_sox")
+
+    stadium_df = data.frame(
+      x = sCDF[stadium_index, 2][[1]],
+      y = sCDF[stadium_index, 3][[1]]
+    )
+
+    seam_ex_in_stadium = seam_ex |>
+      filter(paste(x, y) %in% paste(stadium_df$x, stadium_df$y))
+
+    #changed to data table for computational speed
+    seam_ex_in_stadium = as.data.table(seam_ex_in_stadium); seam_ex_in_stadium[,  ":=" (euclid = sqrt(x ^ 2 + y ^ 2))]
+
+    sim_ann_maximization = sum_maximization_coverage_function(500, 500)
+    sim_ann_output = sim_ann_maximization[[1]]; sim_ann_coverage = sim_ann_maximization[[2]]
+
+    seam_coverage = in_range_coverage_oos(sim_ann_output,
+                                          10000,
+                                          lh_batters[i])
+
+    temp_row = list(pitcher = rh_pitchers[j],
+                    batter = lh_batters[i],
+                    rhp = TRUE,
+                    rhb = FALSE,
+                    babip_rel_err = (seam_coverage - standard_coverage_sampling) / standard_coverage_sampling)
+    matchup_dt = rbind(matchup_dt,
+                       temp_row)
+
+  }
+
+  # iterating through LHP
+  for (j in 1:length(lh_pitchers)) {
+
+    seam_ex = shiny_seam_helper(
+    b = lh_batters[i],
+    p = lh_pitchers[j],
+    br = .85,
+    pr = .85)$seam_df
+
+    stadium_index = which(sCDF$stadiumName == "white_sox")
+
+    stadium_df = data.frame(
+      x = sCDF[stadium_index, 2][[1]],
+      y = sCDF[stadium_index, 3][[1]]
+    )
+
+    seam_ex_in_stadium = seam_ex |>
+      filter(paste(x, y) %in% paste(stadium_df$x, stadium_df$y))
+
+    #changed to data table for computational speed
+    seam_ex_in_stadium = as.data.table(seam_ex_in_stadium); seam_ex_in_stadium[,  ":=" (euclid = sqrt(x ^ 2 + y ^ 2))]
+
+    sim_ann_maximization = sum_maximization_coverage_function(500, 500)
+    sim_ann_output = sim_ann_maximization[[1]]; sim_ann_coverage = sim_ann_maximization[[2]]
+
+    seam_coverage = in_range_coverage_oos(sim_ann_output,
+                                          10000,
+                                          lh_batters[i])
+
+    temp_row = list(pitcher = lh_pitchers[j],
+                    batter = lh_batters[i],
+                    rhp = FALSE,
+                    rhb = FALSE,
+                    babip_rel_err = (seam_coverage - standard_coverage_sampling) / standard_coverage_sampling)
+    matchup_dt = rbind(matchup_dt,
+                       temp_row)
+
+  }
+}
+
+saveRDS(matchup_dt, "sampling-babip-validation-oos-changed_batters.rds")
+```
+
+
+# 3: Analysis
+
+## 3.1: BABIP Error Analysis with Sampling
+
+```{r}
+babip_error = data.table(readRDS("sampling-babip-validation-oos-changed_batters.rds"))
+
+# cleaning data
+babip_error = babip_error[-1, list(pitcher, batter, babip_rel_err, rhp, rhb)]
+babip_error$babip_rel_err = babip_error$babip_rel_err * 100
+
+# table to TeX file
+babip_error_tex = babip_error[, list(pitcher, batter, babip_rel_err)]
+xtable(babip_error_tex, digits = 4)
+
+
+
+# histogram of errors
+hist(babip_error$babip_rel_err,
+     breaks = 40,
+     xlab = "Relative Error",
+     main = "Histogram of Relative Error in BABIP")
+
+# deciles
+quantile(babip_error$babip_rel_err,
+         probs = seq(0, 1, by = .1))
+
+# data summary
+summary(babip_error$babip_rel_err)
+
+# density plot
+plot(density(babip_error$babip_rel_err),
+     xlab = "Relative Error",
+     ylab = "Density",
+     main = "Density vs Relative Error in BABIP")
+rug(babip_error$babip_rel_err, col='red')
+
+# qq-plot
+qqnorm(babip_error$babip_rel_err,
+       pch = 1, 
+       frame = FALSE)
+qqline(babip_error$babip_rel_err, 
+       col = "steelblue", 
+       lwd = 2)
+
+# Shapiro-Wilkes Test for normality
+shapiro.test(babip_error$babip_rel_err)
+
+# Kolmogorov-Smirnov Test for normality
+ks.test(babip_error$babip_rel_err, 
+        'pnorm',
+        alternative = "two.sided")
+```
+
+
+### 3.1.1: RHP vs RHB
+
+```{r}
+# Filtering to correct hand
+rhp_rhb_babip_error = babip_error[rhp == TRUE & rhb == TRUE]
+
+# Histogram of errors
+hist(rhp_rhb_babip_error$babip_rel_err,
+     breaks = 15,
+     xlab = "Relative Error",
+     main = "Histogram of Relative Error in BABIP for RHP v RHB")
+
+# deciles
+quantile(rhp_rhb_babip_error$babip_rel_err, 
+         probs = seq(0, 1, by = .1))
+
+# data summary
+summary(rhp_rhb_babip_error$babip_rel_err)
+
+# density plot
+plot(density(rhp_rhb_babip_error$babip_rel_err),
+     xlab = "Relative Error",
+     ylab = "Density",
+     main = "Density vs Relative Error RHP v RHB")
+rug(rhp_rhb_babip_error$babip_rel_err, col='red')
+
+# qq-plot
+qqnorm(rhp_rhb_babip_error$babip_rel_err,
+       pch = 1, 
+       frame = FALSE)
+qqline(rhp_rhb_babip_error$babip_rel_err, 
+       col = "steelblue", 
+       lwd = 2)
+
+# Shapiro-Wilkes Test for normality
+shapiro.test(rhp_rhb_babip_error$babip_rel_err)
+
+# Kolmogorov-Smirnov Test for normality
+ks.test(rhp_rhb_babip_error$babip_rel_err, 
+        'pnorm',
+        alternative = "two.sided")
+```
+
+
+### 3.1.2: RHP vs LHB
+
+```{r}
+# Filtering to correct hand
+rhp_lhb_babip_error = babip_error[rhp == TRUE & rhb == FALSE]
+
+# Histogram of errors
+hist(rhp_lhb_babip_error$babip_rel_err,
+     breaks = 15,
+     xlab = "Relative Error",
+     main = "Histogram of Relative Error in BABIP for RHP v LHB")
+
+# deciles
+quantile(rhp_lhb_babip_error$babip_rel_err, 
+         probs = seq(0, 1, by = .1))
+
+# data summary
+summary(rhp_lhb_babip_error$babip_rel_err)
+
+# density plot
+plot(density(rhp_lhb_babip_error$babip_rel_err),
+     xlab = "Relative Error",
+     ylab = "Density",
+     main = "Density vs Relative Error RHP v LHB")
+rug(rhp_lhb_babip_error$babip_rel_err, col='red')
+
+# qq-plot
+qqnorm(rhp_lhb_babip_error$babip_rel_err,
+       pch = 1, 
+       frame = FALSE)
+qqline(rhp_lhb_babip_error$babip_rel_err, 
+       col = "steelblue", 
+       lwd = 2)
+
+# Shapiro-Wilkes Test for normality
+shapiro.test(rhp_lhb_babip_error$babip_rel_err)
+
+# Kolmogorov-Smirnov Test for normality
+ks.test(rhp_lhb_babip_error$babip_rel_err, 
+        'pnorm',
+        alternative = "two.sided")
+```
+
+
+### 3.1.3: LHP vs RHB
+
+```{r}
+# Filtering to correct hand
+lhp_rhb_babip_error = babip_error[rhp == FALSE & rhb == TRUE]
+
+# Histogram of errors
+hist(lhp_rhb_babip_error$babip_rel_err,
+     breaks = 15,
+     xlab = "Relative Error",
+     main = "Histogram of Relative Error in BABIP for LHP v RHB")
+
+# deciles
+quantile(lhp_rhb_babip_error$babip_rel_err, 
+         probs = seq(0, 1, by = .1))
+
+# data summary
+summary(lhp_rhb_babip_error$babip_rel_err)
+
+# density plot
+plot(density(lhp_rhb_babip_error$babip_rel_err),
+     xlab = "Relative Error",
+     ylab = "Density",
+     main = "Density vs Relative Error LHP v RHB")
+rug(lhp_rhb_babip_error$babip_rel_err, col='red')
+
+# qq-plot
+qqnorm(lhp_rhb_babip_error$babip_rel_err,
+       pch = 1, 
+       frame = FALSE)
+qqline(lhp_rhb_babip_error$babip_rel_err, 
+       col = "steelblue", 
+       lwd = 2)
+
+# Shapiro-Wilkes Test for normality
+shapiro.test(lhp_rhb_babip_error$babip_rel_err)
+
+# Kolmogorov-Smirnov Test for normality
+ks.test(lhp_rhb_babip_error$babip_rel_err, 
+        'pnorm',
+        alternative = "two.sided")
+```
+
+
+### 3.1.4: LHP vs LHB
+
+```{r}
+# Filtering to correct hand
+lhp_lhb_babip_error = babip_error[rhp == FALSE & rhb == FALSE]
+
+# Histogram of errors
+hist(lhp_lhb_babip_error$babip_rel_err,
+     breaks = 15,
+     xlab = "Relative Error",
+     main = "Histogram of Relative Error in BABIP for LHP v LHB")
+
+# deciles
+quantile(lhp_lhb_babip_error$babip_rel_err, 
+         probs = seq(0, 1, by = .1))
+
+# data summary
+summary(lhp_lhb_babip_error$babip_rel_err)
+
+# density plot
+plot(density(lhp_lhb_babip_error$babip_rel_err),
+     xlab = "Relative Error",
+     ylab = "Density",
+     main = "Density vs Relative Error LHP v LHB")
+rug(lhp_lhb_babip_error$babip_rel_err, col='red')
+
+# qq-plot
+qqnorm(lhp_lhb_babip_error$babip_rel_err,
+       pch = 1, 
+       frame = FALSE)
+qqline(lhp_lhb_babip_error$babip_rel_err, 
+       col = "steelblue", 
+       lwd = 2)
+
+# Shapiro-Wilkes Test for normality
+shapiro.test(lhp_lhb_babip_error$babip_rel_err)
+
+# Kolmogorov-Smirnov Test for normality
+ks.test(lhp_lhb_babip_error$babip_rel_err, 
+        'pnorm',
+        alternative = "two.sided")
+```
+
+### 3.2.6: Some Shift Analysis
+
+```{r}
+statcast_raw = data.table(readRDS("2022-full-validation.rds"))
+
+statcast_raw = statcast_raw[, c("pitcher_name", "batter_name", "events", "description", "stand", "p_throws", "hc_x", "hc_y", "babip_value", "if_fielding_alignment", "of_fielding_alignment")]
+statcast_raw[, hc_x := (hc_x - 125.42)]; statcast_raw[, hc_y := (198.27 - hc_y)]
+setnames(statcast_raw, old = "hc_x", new = "x"); setnames(statcast_raw, old = "hc_y", new = "y")
+
+harper_statcast = statcast_raw[batter_name == "Bryce Harper"]
+
+# plotting balls in play
+plot(y ~ x, harper_statcast)
+```
+
+```{r}
+# calculating BABIP
+hits_minus_homeruns = nrow(harper_statcast[description == "hit_into_play" & events %chin% c("single", "double", "triple")])
+ab_min_hr_min_k_pl_sacfly = nrow(harper_statcast[events %chin% c("single", 
+                                                                 "double", 
+                                                                 "triple", 
+                                                                 "field_out", 
+                                                                 "grounded_into_double_play", 
+                                                                 "force_out",
+                                                                 "fielders_choice",
+                                                                 "field_error",
+                                                                 "double_play",
+                                                                 "sac_fly")])
+harper_total_babip = hits_minus_homeruns / ab_min_hr_min_k_pl_sacfly
+```
+
+
+
+```{r}
+# Harper BABIP agains standard alignments vs infield shift/strategic shift
+harper_statcast_standard = harper_statcast[if_fielding_alignment == "Standard"]
+harper_statcast_shifted = harper_statcast[if_fielding_alignment %chin% c("Infield shift", "Strategic")]
+
+hits_minus_homeruns = nrow(harper_statcast_standard[description == "hit_into_play" & events %chin% c("single", "double", "triple")])
+ab_min_hr_min_k_pl_sacfly = nrow(harper_statcast_standard[events %chin% c("single", 
+                                                                 "double", 
+                                                                 "triple", 
+                                                                 "field_out", 
+                                                                 "grounded_into_double_play", 
+                                                                 "force_out",
+                                                                 "fielders_choice",
+                                                                 "field_error",
+                                                                 "double_play",
+                                                                 "sac_fly")])
+harper_standard_babip = hits_minus_homeruns / ab_min_hr_min_k_pl_sacfly
+
+
+hits_minus_homeruns = nrow(harper_statcast_shifted[description == "hit_into_play" & events %chin% c("single", "double", "triple")])
+ab_min_hr_min_k_pl_sacfly = nrow(harper_statcast_shifted[events %chin% c("single", 
+                                                                 "double", 
+                                                                 "triple", 
+                                                                 "field_out", 
+                                                                 "grounded_into_double_play", 
+                                                                 "force_out",
+                                                                 "fielders_choice",
+                                                                 "field_error",
+                                                                 "double_play",
+                                                                 "sac_fly")])
+harper_shifted_babip = hits_minus_homeruns / ab_min_hr_min_k_pl_sacfly
+```
+
+
+
+
+
