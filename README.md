@@ -10,7 +10,7 @@ I will give a short description of each folder's contents.
 
 
 ## Fielder Shape Justification
-This contains the file that generates the GAMs for each position based on whether they can field a ball in play. This is used to justify the elliptic fielder shape in the optimization's implementation.
+Generates the GAMs trained on Statcast data for each position based on whether they can field a ball in play. This is used to justify the elliptic fielder shape in the optimization's implementation.
 
 ## Generating Field Coordinates
 File used to filter the SEAM distribution to fair territory for each stadium. The output is a flattened data table containing the in-play coordinates for each stadium.
