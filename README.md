@@ -13,7 +13,7 @@ I will give a short description of each folder's contents.
 Generates the GAMs trained on Statcast data for each position based on whether they can field a ball in play. This is used to justify the elliptic fielder shape in the optimization's implementation.
 
 ## Generating Field Coordinates
-File used to filter the SEAM distribution to fair territory for each stadium. The output is a flattened data table containing the in-play coordinates for each stadium.
+File used to filter the SEAM distribution to fair territory for each stadium. The output is a flattened data table containing the in-play coordinates.
 
 ## Plots
 Images of validation results, fielder shape justification, and the "Visualizations" section.
